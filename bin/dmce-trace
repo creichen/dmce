@@ -26,9 +26,26 @@ import os
 import re
 import glob
 import multiprocessing
+import subprocess
 from colorama import Fore, Back, Style
 
-parser = argparse.ArgumentParser(description='{}'.format(os.path.basename(__file__)), epilog='\nPlease note: use --bundle only together with the 3 required parameters')
+desc_gen = '''
+
+general:
+
+  Parameters \'probefile\' and \'codetree\' can be comma separated lists if tracing code from more than one repo.
+
+  In order for dmce-trace to obtain unique probe numbers for dmce passes on multiple repos separate probe number
+  ranges shall be used, please see dmce --help for more info.
+
+'''
+
+desc_epi = '''
+
+
+'''
+
+parser = argparse.ArgumentParser(description = desc_gen, epilog = desc_epi, formatter_class=argparse.RawTextHelpFormatter)
 parser.add_argument('dfile',            type=str,                   help='default: /tmp/$USER/dmce/dmcebuffer.bin-[program invocation short name].[pid]')
 parser.add_argument('probefile',        type=str,                   help='default: /tmp/$USER/dmce/name-of-git/probe-references.log')
 parser.add_argument('codetree',         type=str,                   help='path to code tree (git)')
@@ -46,6 +63,8 @@ parser.add_argument('-t',               action='store_true',        help='Show t
 parser.add_argument('--hl',             action='store_true',        help='Highlight current source code line')
 parser.add_argument('--bundle',         action='store_true',        help='Generate bundle .zip file in current directory, implies -t --delimiter @')
 parser.add_argument('--nocompress',     action='store_true',        help='Used together with --bundle creates uncompressed .zip archive')
+parser.add_argument('--nosrc',          action='store_true',        help='Used together with --bundle to avoid source files within .zip archive')
+parser.add_argument('--followsymlinks', action='store_true',        help='Also follow symbolic links when adding source tree files into the bundle')
 
 args = parser.parse_args()
 
@@ -56,6 +75,13 @@ if not os.path.isfile(args.dfile):
 if not os.path.isfile(args.dfile + ".info"):
     print("dmce-trace: Could not find .info file: " + args.dfile + ".info", file = sys.stderr)
     exit(1)
+
+if args.sort == "seq":
+    trace_out = True
+else:
+    trace_out = False
+    if args.bundle:
+        print("dmce-trace: Can not combine --bundle and --sort, abort", file = sys.stderr)
 
 outfile = sys.stdout
 
@@ -332,12 +358,27 @@ def notComplete(timestamp):
 tree = []
 treedict = []
 probedtree = []
+symlinks = []
 
 for i in range(numfrefs):
-    tree_tmp = glob.glob(codetree[i] + "/**", recursive = True)
+
     treedict_tmp = {}
     probedtree_tmp = False
     re_source = re.compile(r'\.c$|\.cpp$|\.cc$|\.h$|\.hh$')
+
+    searchpath = codetree[i]
+
+    if args.followsymlinks:
+        tree_tmp = glob.glob(searchpath + "/**", recursive = True)
+
+    else:
+        cmd = (
+            f'find {searchpath} -type f ! -path '
+            f'"$(find {searchpath} -type l -exec readlink -f {{}} \\; | sed \'s|$|/*|\' | tr \'\\n\' \':\')"'
+        )
+
+        result = subprocess.run(cmd, shell=True, text=True, capture_output=True, check=True)
+        tree_tmp = result.stdout.splitlines()
 
     for filename in tree_tmp:
         if os.path.isfile(filename) and re_source.search(filename):
@@ -608,7 +649,8 @@ if not args.bundle:
         if outbuf == None:
             break
         for outstr in outbuf:
-            print(outstr.encode(encoding="ascii",errors="ignore").decode(), file = outfile)
+            if trace_out:
+                print(outstr.encode(encoding="ascii",errors="ignore").decode(), file = outfile)
 else:
     # In bundles, create several numbered data files for easier handling of large traces at later stages
     filecount = 1
@@ -683,14 +725,30 @@ if args.sort != "seq":
 
 outfile.close()
 
-
 # If bundle, zip it!
 if args.bundle:
     import zipfile
     import fnmatch
 
+    print("Recreating probe references...")
+    merged_probe_references = []
+    for i in range(len(prefs)):
+        ct = os.path.basename(codetree[i])
+        for line in prefs[i]:
+            ltmp = line.split(':')
+            ltmp[1] = ct + "/" + ltmp[1]
+            ltmp = ":".join(ltmp)
+            merged_probe_references.append(ltmp)
+
+    # Prepare recreated probefile to be added to zip
+    with open("global_probe_references.log", "w") as pfo:
+        pfo.writelines(merged_probe_references)
+        outfilenames.append("global_probe_references.log")
+
     with zipfile.ZipFile(outzip, 'w') as z:
         count = 0
+
+        # Write output files (fragmented trace file, global probe refs file) to zip
         for of in outfilenames:
             if args.nocompress:
                 print("Adding to archive: frag " + str(count) + " out of " + str(len(outfilenames)))
@@ -700,15 +758,19 @@ if args.bundle:
                 z.write(of, of, compress_type=zipfile.ZIP_DEFLATED)
             count += 1
 
-        print("Picking relevant source files")
-        for fname in uniqsourcefiles:
-            for c in codetree:
-                if c in fname:
-                    dest = fname.replace(os.path.dirname(c) + "/", "")
-                    if args.nocompress:
-                        z.write(fname, dest)
-                    else:
-                        z.write(fname, dest, compress_type=zipfile.ZIP_DEFLATED)
+        # Write source files to zip
+        if args.nosrc:
+            print("info: --nosrc: skip source files in zip bundle")
+        else:
+            print("info: include source files in zip bundle")
+            for fname in uniqsourcefiles:
+                for c in codetree:
+                    if c in fname:
+                        dest = fname.replace(os.path.dirname(c) + "/", "")
+                        if args.nocompress:
+                            z.write(fname, dest)
+                        else:
+                            z.write(fname, dest, compress_type=zipfile.ZIP_DEFLATED)
         z.close()
 
     # zipfile needs a barrier
